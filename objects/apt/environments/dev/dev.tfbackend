@@ -1,0 +1,2 @@
+bucket = "my-tfstate-bucket"
+prefix = "objects/apt/dev"

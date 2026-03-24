@@ -1,0 +1,770 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, closed]
+    # opened/synchronize/reopened → plan jobs (PR open/update)
+    # closed with merged=true     → apply jobs (merge only)
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.0.8"
+  REPORTING_DATASETS: '["reporting"]'
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 1 — detect what changed + build deployment groups
+  # ────────────────────────────────────────────────────────────────────────────
+  detect:
+    name: Detect changes
+    runs-on: self-hosted
+    outputs:
+      infra_changed: ${{ steps.detect.outputs.infra_changed }}
+      group_a:       ${{ steps.detect.outputs.group_a }}
+      group_b:       ${{ steps.detect.outputs.group_b }}
+      group_c:       ${{ steps.detect.outputs.group_c }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed paths and build groups
+        id: detect
+        run: |
+          if [ "${{ github.event.action }}" == "closed" ]; then
+            CHANGED=$(git diff --name-only HEAD~1 HEAD)
+          else
+            CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
+          fi
+
+          echo "=== Changed files ==="
+          echo "$CHANGED"
+
+          # infra changed = any .tf/.tfvars outside objects/
+          INFRA=$(echo "$CHANGED" \
+            | grep -v '^objects/' \
+            | grep -E '\.tf$|\.tfvars$' \
+            | wc -l)
+          [ "$INFRA" -gt "0" ] \
+            && echo "infra_changed=true"  >> $GITHUB_OUTPUT \
+            || echo "infra_changed=false" >> $GITHUB_OUTPUT
+
+          FOLDERS=$(echo "$CHANGED" \
+            | grep '^objects/' \
+            | cut -d'/' -f2 \
+            | sort -u)
+
+          echo "=== Changed object folders ==="
+          echo "$FOLDERS"
+
+          GROUP_A=()
+          GROUP_B=()
+          GROUP_C=()
+
+          for folder in $FOLDERS; do
+            if echo '${{ env.REPORTING_DATASETS }}' \
+                | jq -e --arg f "$folder" 'contains([$f])' > /dev/null 2>&1; then
+              GROUP_C+=("$folder")
+            elif [ -f "objects/$folder/.depends_on" ]; then
+              GROUP_B+=("$folder")
+              echo "$folder depends on: $(cat objects/$folder/.depends_on)"
+            else
+              GROUP_A+=("$folder")
+            fi
+          done
+
+          # circular dependency check
+          for folder in "${GROUP_B[@]}"; do
+            dep=$(cat "objects/$folder/.depends_on")
+            if [ -f "objects/$dep/.depends_on" ]; then
+              dep_of_dep=$(cat "objects/$dep/.depends_on")
+              if [ "$dep_of_dep" == "$folder" ]; then
+                echo "ERROR: Circular dependency: $folder ↔ $dep"
+                exit 1
+              fi
+            fi
+          done
+
+          GA=$(printf '%s\n' "${GROUP_A[@]}" | jq -R . | jq -sc . 2>/dev/null || echo "[]")
+          GB=$(printf '%s\n' "${GROUP_B[@]}" | jq -R . | jq -sc . 2>/dev/null || echo "[]")
+          GC=$(printf '%s\n' "${GROUP_C[@]}" | jq -R . | jq -sc . 2>/dev/null || echo "[]")
+
+          [ "$GA" == "null" ] || [ -z "$GA" ] && GA="[]"
+          [ "$GB" == "null" ] || [ -z "$GB" ] && GB="[]"
+          [ "$GC" == "null" ] || [ -z "$GC" ] && GC="[]"
+
+          echo "group_a=$GA" >> $GITHUB_OUTPUT
+          echo "group_b=$GB" >> $GITHUB_OUTPUT
+          echo "group_c=$GC" >> $GITHUB_OUTPUT
+
+          echo "=== Groups ==="
+          echo "Group A: $GA"
+          echo "Group B: $GB"
+          echo "Group C: $GC"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 2 — pre-commit (PR open/update only)
+  # vars.ACT_LOCAL — set as repo variable in GitHub Settings → Variables
+  # value = "true" when testing locally, "" in real GitHub Actions
+  # ────────────────────────────────────────────────────────────────────────────
+  pre-commit:
+    name: Pre-commit checks
+    runs-on: self-hosted
+    needs: detect
+    if: |
+      github.event.action != 'closed'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run pre-commit
+        if: vars.ACT_LOCAL != 'true'
+        run: |
+          pip install pre-commit
+          pre-commit run --all-files --show-diff-on-failure --color always
+
+      - name: Skip pre-commit (local act mode)
+        if: vars.ACT_LOCAL == 'true'
+        run: echo "ACT_LOCAL=true — skipping pre-commit"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 3 — prepare combined folder list for plan matrix
+  # ────────────────────────────────────────────────────────────────────────────
+  plan-objects-prepare:
+    name: Prepare object folders for plan
+    runs-on: self-hosted
+    needs: detect
+    if: github.event.action != 'closed'
+    outputs:
+      all_folders: ${{ steps.merge.outputs.all_folders }}
+    steps:
+      - name: Merge all groups into one list
+        id: merge
+        run: |
+          GA='${{ needs.detect.outputs.group_a }}'
+          GB='${{ needs.detect.outputs.group_b }}'
+          GC='${{ needs.detect.outputs.group_c }}'
+
+          MERGED=$(echo "[$GA,$GB,$GC]" \
+            | jq 'flatten | unique' 2>/dev/null || echo '[]')
+
+          [ "$MERGED" == "[]" ] || [ -z "$MERGED" ] \
+            && MERGED='["_no_change"]'
+
+          echo "all_folders=$MERGED" >> $GITHUB_OUTPUT
+          echo "Combined folders: $MERGED"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 4 — plan infra × 3 envs (PR only)
+  # always runs — exits green with message if nothing changed
+  # ────────────────────────────────────────────────────────────────────────────
+  plan-infra:
+    name: Plan infra (${{ matrix.env }})
+    runs-on: self-hosted
+    needs: [detect, pre-commit]
+    if: github.event.action != 'closed'
+    strategy:
+      matrix:
+        env: [dev, tst, prd]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No infra changes
+        if: needs.detect.outputs.infra_changed == 'false'
+        run: echo "No infra changes — plan skipped. Check passes for branch protection."
+
+      - name: Auth GCP
+        if: |
+          needs.detect.outputs.infra_changed == 'true' &&
+          vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+
+      - name: Setup terraform
+        if: needs.detect.outputs.infra_changed == 'true'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform init (${{ matrix.env }})
+        if: needs.detect.outputs.infra_changed == 'true'
+        run: |
+          terraform init \
+            -backend-config=environments/${{ matrix.env }}/${{ matrix.env }}.tfbackend \
+            -reconfigure -input=false -no-color
+
+      - name: Terraform plan (${{ matrix.env }})
+        if: needs.detect.outputs.infra_changed == 'true'
+        run: |
+          terraform plan \
+            -var-file=environments/${{ matrix.env }}/${{ matrix.env }}.tfvars \
+            -input=false -no-color 2>&1 | tee plan_output.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Post plan to PR (${{ matrix.env }})
+        if: |
+          needs.detect.outputs.infra_changed == 'true' &&
+          vars.ACT_LOCAL != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('plan_output.txt', 'utf8');
+            const body = plan.length > 60000
+              ? plan.slice(0, 60000) + '\n...(truncated)'
+              : plan;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `### Plan — \`infra\` / \`${{ matrix.env }}\`\n\`\`\`\n${body}\n\`\`\``
+            });
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 5 — plan objects × all groups × 3 envs (PR only)
+  # ────────────────────────────────────────────────────────────────────────────
+  plan-objects:
+    name: Plan objects/${{ matrix.folder }} (${{ matrix.env }})
+    runs-on: self-hosted
+    needs: [detect, pre-commit, plan-objects-prepare]
+    if: github.event.action != 'closed'
+    strategy:
+      matrix:
+        folder: ${{ fromJson(needs.plan-objects-prepare.outputs.all_folders) }}
+        env: [dev, tst, prd]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No object changes
+        if: matrix.folder == '_no_change'
+        run: echo "No object changes — plan skipped. Check passes for branch protection."
+
+      - name: Auth GCP
+        if: |
+          matrix.folder != '_no_change' &&
+          vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+
+      - name: Setup terraform
+        if: matrix.folder != '_no_change'
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Init — ${{ matrix.folder }} (${{ matrix.env }})
+        if: matrix.folder != '_no_change'
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform init \
+            -backend-config=environments/${{ matrix.env }}/${{ matrix.env }}.tfbackend \
+            -reconfigure -input=false -no-color
+
+      - name: Plan — ${{ matrix.folder }} (${{ matrix.env }})
+        if: matrix.folder != '_no_change'
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform plan \
+            -var-file=environments/${{ matrix.env }}/${{ matrix.env }}.tfvars \
+            -input=false -no-color 2>&1 | tee plan_output.txt
+          exit ${PIPESTATUS[0]}
+
+      - name: Post plan to PR — ${{ matrix.folder }} (${{ matrix.env }})
+        if: |
+          matrix.folder != '_no_change' &&
+          vars.ACT_LOCAL != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync(
+              'objects/${{ matrix.folder }}/plan_output.txt', 'utf8'
+            );
+            const body = plan.length > 60000
+              ? plan.slice(0, 60000) + '\n...(truncated)'
+              : plan;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `### Plan — \`objects/${{ matrix.folder }}\` / \`${{ matrix.env }}\`\n\`\`\`\n${body}\n\`\`\``
+            });
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # APPLY — only when PR is merged (closed + merged=true)
+  # order: infra → group_a → group_b → group_c  per env
+  # dev auto, tst + prd manual approval gates
+  # ────────────────────────────────────────────────────────────────────────────
+
+  # ── DEV ──────────────────────────────────────────────────────────────────────
+  apply-infra-dev:
+    name: Apply infra — dev
+    runs-on: self-hosted
+    needs: detect
+    if: |
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      needs.detect.outputs.infra_changed == 'true'
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auth GCP
+        if: vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        run: |
+          terraform init \
+            -backend-config=environments/dev/dev.tfbackend \
+            -reconfigure -input=false -no-color
+      - name: Apply
+        run: |
+          terraform apply \
+            -var-file=environments/dev/dev.tfvars \
+            -auto-approve -input=false -no-color \
+            -parallelism=10
+
+  apply-group-a-dev:
+    name: Apply Group A/${{ matrix.folder }} — dev
+    runs-on: self-hosted
+    needs: [detect, apply-infra-dev]
+    if: |
+      always() &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      needs.detect.outputs.group_a != '[]' &&
+      (needs.apply-infra-dev.result == 'success' ||
+       needs.apply-infra-dev.result == 'skipped')
+    environment: dev
+    strategy:
+      matrix:
+        folder: ${{ fromJson(needs.detect.outputs.group_a) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auth GCP
+        if: vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform init \
+            -backend-config=environments/dev/dev.tfbackend \
+            -reconfigure -input=false -no-color
+      - name: Apply — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform apply \
+            -var-file=environments/dev/dev.tfvars \
+            -auto-approve -input=false -no-color \
+            -parallelism=10
+
+  apply-group-b-dev:
+    name: Apply Group B/${{ matrix.folder }} — dev
+    runs-on: self-hosted
+    needs: [detect, apply-group-a-dev]
+    if: |
+      always() &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      needs.detect.outputs.group_b != '[]' &&
+      (needs.apply-group-a-dev.result == 'success' ||
+       needs.apply-group-a-dev.result == 'skipped')
+    environment: dev
+    strategy:
+      matrix:
+        folder: ${{ fromJson(needs.detect.outputs.group_b) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auth GCP
+        if: vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform init \
+            -backend-config=environments/dev/dev.tfbackend \
+            -reconfigure -input=false -no-color
+      - name: Apply — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform apply \
+            -var-file=environments/dev/dev.tfvars \
+            -auto-approve -input=false -no-color \
+            -parallelism=10
+
+  apply-group-c-dev:
+    name: Apply Group C/${{ matrix.folder }} — dev
+    runs-on: self-hosted
+    needs: [detect, apply-group-b-dev]
+    if: |
+      always() &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      needs.detect.outputs.group_c != '[]' &&
+      (needs.apply-group-b-dev.result == 'success' ||
+       needs.apply-group-b-dev.result == 'skipped')
+    environment: dev
+    strategy:
+      matrix:
+        folder: ${{ fromJson(needs.detect.outputs.group_c) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auth GCP
+        if: vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform init \
+            -backend-config=environments/dev/dev.tfbackend \
+            -reconfigure -input=false -no-color
+      - name: Apply — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform apply \
+            -var-file=environments/dev/dev.tfvars \
+            -auto-approve -input=false -no-color \
+            -parallelism=10
+
+  # ── TST — manual approval gate ────────────────────────────────────────────────
+  apply-infra-tst:
+    name: Apply infra — tst
+    runs-on: self-hosted
+    needs: [detect, apply-infra-dev, apply-group-a-dev, apply-group-b-dev, apply-group-c-dev]
+    if: |
+      always() &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      needs.detect.outputs.infra_changed == 'true' &&
+      (needs.apply-infra-dev.result == 'success' ||
+       needs.apply-infra-dev.result == 'skipped') &&
+      (needs.apply-group-c-dev.result == 'success' ||
+       needs.apply-group-c-dev.result == 'skipped')
+    environment: tst
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auth GCP
+        if: vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        run: |
+          terraform init \
+            -backend-config=environments/tst/tst.tfbackend \
+            -reconfigure -input=false -no-color
+      - name: Apply
+        run: |
+          terraform apply \
+            -var-file=environments/tst/tst.tfvars \
+            -auto-approve -input=false -no-color \
+            -parallelism=10
+
+  apply-group-a-tst:
+    name: Apply Group A/${{ matrix.folder }} — tst
+    runs-on: self-hosted
+    needs: [detect, apply-infra-tst]
+    if: |
+      always() &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      needs.detect.outputs.group_a != '[]' &&
+      (needs.apply-infra-tst.result == 'success' ||
+       needs.apply-infra-tst.result == 'skipped')
+    environment: tst
+    strategy:
+      matrix:
+        folder: ${{ fromJson(needs.detect.outputs.group_a) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auth GCP
+        if: vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform init \
+            -backend-config=environments/tst/tst.tfbackend \
+            -reconfigure -input=false -no-color
+      - name: Apply — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform apply \
+            -var-file=environments/tst/tst.tfvars \
+            -auto-approve -input=false -no-color \
+            -parallelism=10
+
+  apply-group-b-tst:
+    name: Apply Group B/${{ matrix.folder }} — tst
+    runs-on: self-hosted
+    needs: [detect, apply-group-a-tst]
+    if: |
+      always() &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      needs.detect.outputs.group_b != '[]' &&
+      (needs.apply-group-a-tst.result == 'success' ||
+       needs.apply-group-a-tst.result == 'skipped')
+    environment: tst
+    strategy:
+      matrix:
+        folder: ${{ fromJson(needs.detect.outputs.group_b) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auth GCP
+        if: vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform init \
+            -backend-config=environments/tst/tst.tfbackend \
+            -reconfigure -input=false -no-color
+      - name: Apply — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform apply \
+            -var-file=environments/tst/tst.tfvars \
+            -auto-approve -input=false -no-color \
+            -parallelism=10
+
+  apply-group-c-tst:
+    name: Apply Group C/${{ matrix.folder }} — tst
+    runs-on: self-hosted
+    needs: [detect, apply-group-b-tst]
+    if: |
+      always() &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      needs.detect.outputs.group_c != '[]' &&
+      (needs.apply-group-b-tst.result == 'success' ||
+       needs.apply-group-b-tst.result == 'skipped')
+    environment: tst
+    strategy:
+      matrix:
+        folder: ${{ fromJson(needs.detect.outputs.group_c) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auth GCP
+        if: vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform init \
+            -backend-config=environments/tst/tst.tfbackend \
+            -reconfigure -input=false -no-color
+      - name: Apply — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform apply \
+            -var-file=environments/tst/tst.tfvars \
+            -auto-approve -input=false -no-color \
+            -parallelism=10
+
+  # ── PRD — manual approval gate ────────────────────────────────────────────────
+  apply-infra-prd:
+    name: Apply infra — prd
+    runs-on: self-hosted
+    needs: [detect, apply-infra-tst, apply-group-a-tst, apply-group-b-tst, apply-group-c-tst]
+    if: |
+      always() &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      needs.detect.outputs.infra_changed == 'true' &&
+      (needs.apply-infra-tst.result == 'success' ||
+       needs.apply-infra-tst.result == 'skipped') &&
+      (needs.apply-group-c-tst.result == 'success' ||
+       needs.apply-group-c-tst.result == 'skipped')
+    environment: prd
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auth GCP
+        if: vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init
+        run: |
+          terraform init \
+            -backend-config=environments/prd/prd.tfbackend \
+            -reconfigure -input=false -no-color
+      - name: Apply
+        run: |
+          terraform apply \
+            -var-file=environments/prd/prd.tfvars \
+            -auto-approve -input=false -no-color \
+            -parallelism=10
+
+  apply-group-a-prd:
+    name: Apply Group A/${{ matrix.folder }} — prd
+    runs-on: self-hosted
+    needs: [detect, apply-infra-prd]
+    if: |
+      always() &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      needs.detect.outputs.group_a != '[]' &&
+      (needs.apply-infra-prd.result == 'success' ||
+       needs.apply-infra-prd.result == 'skipped')
+    environment: prd
+    strategy:
+      matrix:
+        folder: ${{ fromJson(needs.detect.outputs.group_a) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auth GCP
+        if: vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform init \
+            -backend-config=environments/prd/prd.tfbackend \
+            -reconfigure -input=false -no-color
+      - name: Apply — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform apply \
+            -var-file=environments/prd/prd.tfvars \
+            -auto-approve -input=false -no-color \
+            -parallelism=10
+
+  apply-group-b-prd:
+    name: Apply Group B/${{ matrix.folder }} — prd
+    runs-on: self-hosted
+    needs: [detect, apply-group-a-prd]
+    if: |
+      always() &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      needs.detect.outputs.group_b != '[]' &&
+      (needs.apply-group-a-prd.result == 'success' ||
+       needs.apply-group-a-prd.result == 'skipped')
+    environment: prd
+    strategy:
+      matrix:
+        folder: ${{ fromJson(needs.detect.outputs.group_b) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auth GCP
+        if: vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform init \
+            -backend-config=environments/prd/prd.tfbackend \
+            -reconfigure -input=false -no-color
+      - name: Apply — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform apply \
+            -var-file=environments/prd/prd.tfvars \
+            -auto-approve -input=false -no-color \
+            -parallelism=10
+
+  apply-group-c-prd:
+    name: Apply Group C/${{ matrix.folder }} — prd
+    runs-on: self-hosted
+    needs: [detect, apply-group-b-prd]
+    if: |
+      always() &&
+      github.event.action == 'closed' &&
+      github.event.pull_request.merged == true &&
+      needs.detect.outputs.group_c != '[]' &&
+      (needs.apply-group-b-prd.result == 'success' ||
+       needs.apply-group-b-prd.result == 'skipped')
+    environment: prd
+    strategy:
+      matrix:
+        folder: ${{ fromJson(needs.detect.outputs.group_c) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Auth GCP
+        if: vars.ACT_LOCAL != 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: Init — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform init \
+            -backend-config=environments/prd/prd.tfbackend \
+            -reconfigure -input=false -no-color
+      - name: Apply — ${{ matrix.folder }}
+        working-directory: objects/${{ matrix.folder }}
+        run: |
+          terraform apply \
+            -var-file=environments/prd/prd.tfvars \
+            -auto-approve -input=false -no-color \
+            -parallelism=10
