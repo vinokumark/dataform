@@ -1,0 +1,13 @@
+{
+  "action": "closed",
+  "pull_request": {
+    "number": 3,
+    "base": { "ref": "main" },
+    "head": { "ref": "feat/new-table" },
+    "merged": true
+  },
+  "repository": {
+    "name": "your-repo",
+    "owner": { "login": "your-org" }
+  }
+}
