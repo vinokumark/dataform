@@ -1,0 +1,13 @@
+{
+  "action": "opened",
+  "pull_request": {
+    "number": 2,
+    "base": { "ref": "main" },
+    "head": { "ref": "feat/new-dataset" },
+    "merged": false
+  },
+  "repository": {
+    "name": "your-repo",
+    "owner": { "login": "your-org" }
+  }
+}

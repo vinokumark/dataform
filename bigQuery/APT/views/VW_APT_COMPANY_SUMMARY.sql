@@ -1,0 +1,6 @@
+SELECT
+  COMPANY_ID,
+  COMPANY_NAME,
+  DATE(CREATED_AT) AS created_date
+FROM `${projectid}.${datasetname}.PRC_APT_L1_COMPANY`
+WHERE COMPANY_ID IS NOT NULL
