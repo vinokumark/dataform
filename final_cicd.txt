@@ -3,10 +3,9 @@ name: CI/CD
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened]   # plan on PR
-  pull_request:
-    branches: [main]
-    types: [closed]                          # apply on merge only
+    types: [opened, synchronize, reopened, closed]
+    # opened/synchronize/reopened → plan jobs (PR open/update)
+    # closed with merged=true     → apply jobs (merge only)
 
 permissions:
   contents: read
@@ -14,19 +13,11 @@ permissions:
 
 env:
   TF_VERSION: "1.0.8"
-  # REPORTING_DATASETS — always deployed last in Group C
-  # add more datasets here if needed: '["reporting","analytics"]'
   REPORTING_DATASETS: '["reporting"]'
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
   # Job 1 — detect what changed + build deployment groups
-  #
-  # outputs:
-  #   infra_changed  = true/false
-  #   group_a        = ["apt","ariba"]      independent datasets
-  #   group_b        = ["dataset2"]         datasets with .depends_on
-  #   group_c        = ["reporting"]        always last
   # ────────────────────────────────────────────────────────────────────────────
   detect:
     name: Detect changes
@@ -44,18 +35,16 @@ jobs:
       - name: Detect changed paths and build groups
         id: detect
         run: |
-          # ── get changed files ───────────────────────────────────────────────
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
-          else
+          if [ "${{ github.event.action }}" == "closed" ]; then
             CHANGED=$(git diff --name-only HEAD~1 HEAD)
+          else
+            CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
           fi
 
           echo "=== Changed files ==="
           echo "$CHANGED"
-          echo ""
 
-          # ── infra changed = any .tf/.tfvars outside objects/ ────────────────
+          # infra changed = any .tf/.tfvars outside objects/
           INFRA=$(echo "$CHANGED" \
             | grep -v '^objects/' \
             | grep -E '\.tf$|\.tfvars$' \
@@ -64,7 +53,6 @@ jobs:
             && echo "infra_changed=true"  >> $GITHUB_OUTPUT \
             || echo "infra_changed=false" >> $GITHUB_OUTPUT
 
-          # ── get all changed object folders ──────────────────────────────────
           FOLDERS=$(echo "$CHANGED" \
             | grep '^objects/' \
             | cut -d'/' -f2 \
@@ -72,49 +60,39 @@ jobs:
 
           echo "=== Changed object folders ==="
           echo "$FOLDERS"
-          echo ""
 
-          # ── build three groups ──────────────────────────────────────────────
           GROUP_A=()
           GROUP_B=()
           GROUP_C=()
 
           for folder in $FOLDERS; do
-            # Group C — reporting always last (hardcoded)
             if echo '${{ env.REPORTING_DATASETS }}' \
                 | jq -e --arg f "$folder" 'contains([$f])' > /dev/null 2>&1; then
               GROUP_C+=("$folder")
-
-            # Group B — has .depends_on file
             elif [ -f "objects/$folder/.depends_on" ]; then
               GROUP_B+=("$folder")
               echo "$folder depends on: $(cat objects/$folder/.depends_on)"
-
-            # Group A — independent
             else
               GROUP_A+=("$folder")
             fi
           done
 
-          # ── circular dependency check ────────────────────────────────────────
-          # basic check: dep listed in .depends_on must not depend back
+          # circular dependency check
           for folder in "${GROUP_B[@]}"; do
             dep=$(cat "objects/$folder/.depends_on")
             if [ -f "objects/$dep/.depends_on" ]; then
               dep_of_dep=$(cat "objects/$dep/.depends_on")
               if [ "$dep_of_dep" == "$folder" ]; then
-                echo "ERROR: Circular dependency detected: $folder ↔ $dep"
+                echo "ERROR: Circular dependency: $folder ↔ $dep"
                 exit 1
               fi
             fi
           done
 
-          # ── convert arrays to JSON ───────────────────────────────────────────
           GA=$(printf '%s\n' "${GROUP_A[@]}" | jq -R . | jq -sc . 2>/dev/null || echo "[]")
           GB=$(printf '%s\n' "${GROUP_B[@]}" | jq -R . | jq -sc . 2>/dev/null || echo "[]")
           GC=$(printf '%s\n' "${GROUP_C[@]}" | jq -R . | jq -sc . 2>/dev/null || echo "[]")
 
-          # fallback for empty arrays
           [ "$GA" == "null" ] || [ -z "$GA" ] && GA="[]"
           [ "$GB" == "null" ] || [ -z "$GB" ] && GB="[]"
           [ "$GC" == "null" ] || [ -z "$GC" ] && GC="[]"
@@ -123,46 +101,71 @@ jobs:
           echo "group_b=$GB" >> $GITHUB_OUTPUT
           echo "group_c=$GC" >> $GITHUB_OUTPUT
 
-          echo "=== Deployment groups ==="
-          echo "Group A (independent): $GA"
-          echo "Group B (dependent):   $GB"
-          echo "Group C (reporting):   $GC"
+          echo "=== Groups ==="
+          echo "Group A: $GA"
+          echo "Group B: $GB"
+          echo "Group C: $GC"
 
   # ────────────────────────────────────────────────────────────────────────────
-  # Job 2 — pre-commit (PR only)
+  # Job 2 — pre-commit (PR open/update only)
+  # vars.ACT_LOCAL — set as repo variable in GitHub Settings → Variables
+  # value = "true" when testing locally, "" in real GitHub Actions
   # ────────────────────────────────────────────────────────────────────────────
   pre-commit:
     name: Pre-commit checks
     runs-on: self-hosted
     needs: detect
     if: |
-      github.event_name == 'pull_request' &&
       github.event.action != 'closed'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install pre-commit
-        # skip if running locally with act + no GCP
-        if: env.ACT != 'true'
+      - name: Run pre-commit
+        if: vars.ACT_LOCAL != 'true'
         run: |
           pip install pre-commit
           pre-commit run --all-files --show-diff-on-failure --color always
 
-      - name: Pre-commit (act local mode)
-        if: env.ACT == 'true'
-        run: echo "Skipping pre-commit in local act mode"
+      - name: Skip pre-commit (local act mode)
+        if: vars.ACT_LOCAL == 'true'
+        run: echo "ACT_LOCAL=true — skipping pre-commit"
 
   # ────────────────────────────────────────────────────────────────────────────
-  # Job 3 — plan infra × 3 envs (PR only)
+  # Job 3 — prepare combined folder list for plan matrix
+  # ────────────────────────────────────────────────────────────────────────────
+  plan-objects-prepare:
+    name: Prepare object folders for plan
+    runs-on: self-hosted
+    needs: detect
+    if: github.event.action != 'closed'
+    outputs:
+      all_folders: ${{ steps.merge.outputs.all_folders }}
+    steps:
+      - name: Merge all groups into one list
+        id: merge
+        run: |
+          GA='${{ needs.detect.outputs.group_a }}'
+          GB='${{ needs.detect.outputs.group_b }}'
+          GC='${{ needs.detect.outputs.group_c }}'
+
+          MERGED=$(echo "[$GA,$GB,$GC]" \
+            | jq 'flatten | unique' 2>/dev/null || echo '[]')
+
+          [ "$MERGED" == "[]" ] || [ -z "$MERGED" ] \
+            && MERGED='["_no_change"]'
+
+          echo "all_folders=$MERGED" >> $GITHUB_OUTPUT
+          echo "Combined folders: $MERGED"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 4 — plan infra × 3 envs (PR only)
   # always runs — exits green with message if nothing changed
   # ────────────────────────────────────────────────────────────────────────────
   plan-infra:
     name: Plan infra (${{ matrix.env }})
     runs-on: self-hosted
     needs: [detect, pre-commit]
-    if: |
-      github.event_name == 'pull_request' &&
-      github.event.action != 'closed'
+    if: github.event.action != 'closed'
     strategy:
       matrix:
         env: [dev, tst, prd]
@@ -177,7 +180,7 @@ jobs:
       - name: Auth GCP
         if: |
           needs.detect.outputs.infra_changed == 'true' &&
-          env.ACT != 'true'
+          vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
@@ -197,7 +200,6 @@ jobs:
 
       - name: Terraform plan (${{ matrix.env }})
         if: needs.detect.outputs.infra_changed == 'true'
-        id: plan
         run: |
           terraform plan \
             -var-file=environments/${{ matrix.env }}/${{ matrix.env }}.tfvars \
@@ -207,7 +209,7 @@ jobs:
       - name: Post plan to PR (${{ matrix.env }})
         if: |
           needs.detect.outputs.infra_changed == 'true' &&
-          env.ACT != 'true'
+          vars.ACT_LOCAL != 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -224,27 +226,16 @@ jobs:
             });
 
   # ────────────────────────────────────────────────────────────────────────────
-  # Job 4 — plan objects × all groups × 3 envs (PR only)
-  # runs plan for group_a + group_b + group_c combined
-  # ordering is enforced in apply — plan just validates all
+  # Job 5 — plan objects × all groups × 3 envs (PR only)
   # ────────────────────────────────────────────────────────────────────────────
   plan-objects:
     name: Plan objects/${{ matrix.folder }} (${{ matrix.env }})
     runs-on: self-hosted
-    needs: [detect, pre-commit]
-    if: |
-      github.event_name == 'pull_request' &&
-      github.event.action != 'closed'
+    needs: [detect, pre-commit, plan-objects-prepare]
+    if: github.event.action != 'closed'
     strategy:
       matrix:
-        # combine all groups for planning — order only matters for apply
-        folder: ${{ fromJson(
-          (needs.detect.outputs.group_a != '[]' ||
-           needs.detect.outputs.group_b != '[]' ||
-           needs.detect.outputs.group_c != '[]')
-          && format('{0}', needs.detect.outputs.group_a)
-          || '["_no_change"]'
-        ) }}
+        folder: ${{ fromJson(needs.plan-objects-prepare.outputs.all_folders) }}
         env: [dev, tst, prd]
       fail-fast: false
     steps:
@@ -257,7 +248,7 @@ jobs:
       - name: Auth GCP
         if: |
           matrix.folder != '_no_change' &&
-          env.ACT != 'true'
+          vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
@@ -285,10 +276,10 @@ jobs:
             -input=false -no-color 2>&1 | tee plan_output.txt
           exit ${PIPESTATUS[0]}
 
-      - name: Post plan to PR
+      - name: Post plan to PR — ${{ matrix.folder }} (${{ matrix.env }})
         if: |
           matrix.folder != '_no_change' &&
-          env.ACT != 'true'
+          vars.ACT_LOCAL != 'true'
         uses: actions/github-script@v7
         with:
           script: |
@@ -307,23 +298,17 @@ jobs:
             });
 
   # ────────────────────────────────────────────────────────────────────────────
-  # APPLY — only on PR merged to main
-  # 4-stage order per env: infra → group_a → group_b → group_c
-  # each stage waits for previous via needs:
+  # APPLY — only when PR is merged (closed + merged=true)
+  # order: infra → group_a → group_b → group_c  per env
   # dev auto, tst + prd manual approval gates
   # ────────────────────────────────────────────────────────────────────────────
 
-  # ── HELPER — merged check ────────────────────────────────────────────────────
-  # reusable condition for all apply jobs
-  # github.event.pull_request.merged == true ensures only real merges trigger
-
-  # ── DEV — INFRA ──────────────────────────────────────────────────────────────
+  # ── DEV ──────────────────────────────────────────────────────────────────────
   apply-infra-dev:
     name: Apply infra — dev
     runs-on: self-hosted
     needs: detect
     if: |
-      github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       needs.detect.outputs.infra_changed == 'true'
@@ -331,7 +316,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Auth GCP
-        if: env.ACT != 'true'
+        if: vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
@@ -350,14 +335,12 @@ jobs:
             -auto-approve -input=false -no-color \
             -parallelism=10
 
-  # ── DEV — GROUP A (independent datasets) ─────────────────────────────────────
   apply-group-a-dev:
     name: Apply Group A/${{ matrix.folder }} — dev
     runs-on: self-hosted
     needs: [detect, apply-infra-dev]
     if: |
       always() &&
-      github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       needs.detect.outputs.group_a != '[]' &&
@@ -371,7 +354,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Auth GCP
-        if: env.ACT != 'true'
+        if: vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
@@ -392,14 +375,12 @@ jobs:
             -auto-approve -input=false -no-color \
             -parallelism=10
 
-  # ── DEV — GROUP B (dependent datasets) ───────────────────────────────────────
   apply-group-b-dev:
     name: Apply Group B/${{ matrix.folder }} — dev
     runs-on: self-hosted
     needs: [detect, apply-group-a-dev]
     if: |
       always() &&
-      github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       needs.detect.outputs.group_b != '[]' &&
@@ -413,7 +394,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Auth GCP
-        if: env.ACT != 'true'
+        if: vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
@@ -434,14 +415,12 @@ jobs:
             -auto-approve -input=false -no-color \
             -parallelism=10
 
-  # ── DEV — GROUP C (reporting — always last) ───────────────────────────────────
   apply-group-c-dev:
     name: Apply Group C/${{ matrix.folder }} — dev
     runs-on: self-hosted
     needs: [detect, apply-group-b-dev]
     if: |
       always() &&
-      github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       needs.detect.outputs.group_c != '[]' &&
@@ -455,7 +434,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Auth GCP
-        if: env.ACT != 'true'
+        if: vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
@@ -476,18 +455,13 @@ jobs:
             -auto-approve -input=false -no-color \
             -parallelism=10
 
-  # ── TST — manual approval gate ───────────────────────────────────────────────
-  # same 4-stage pattern as dev
-  # starts only after ALL dev stages complete
-  # environment: tst pauses workflow until someone approves in GitHub UI
-
+  # ── TST — manual approval gate ────────────────────────────────────────────────
   apply-infra-tst:
     name: Apply infra — tst
     runs-on: self-hosted
     needs: [detect, apply-infra-dev, apply-group-a-dev, apply-group-b-dev, apply-group-c-dev]
     if: |
       always() &&
-      github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       needs.detect.outputs.infra_changed == 'true' &&
@@ -499,7 +473,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Auth GCP
-        if: env.ACT != 'true'
+        if: vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
@@ -524,7 +498,6 @@ jobs:
     needs: [detect, apply-infra-tst]
     if: |
       always() &&
-      github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       needs.detect.outputs.group_a != '[]' &&
@@ -538,7 +511,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Auth GCP
-        if: env.ACT != 'true'
+        if: vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
@@ -565,7 +538,6 @@ jobs:
     needs: [detect, apply-group-a-tst]
     if: |
       always() &&
-      github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       needs.detect.outputs.group_b != '[]' &&
@@ -579,7 +551,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Auth GCP
-        if: env.ACT != 'true'
+        if: vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
@@ -606,7 +578,6 @@ jobs:
     needs: [detect, apply-group-b-tst]
     if: |
       always() &&
-      github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       needs.detect.outputs.group_c != '[]' &&
@@ -620,7 +591,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Auth GCP
-        if: env.ACT != 'true'
+        if: vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
@@ -641,16 +612,13 @@ jobs:
             -auto-approve -input=false -no-color \
             -parallelism=10
 
-  # ── PRD — manual approval gate ───────────────────────────────────────────────
-  # same 4-stage pattern, starts only after ALL tst stages complete
-
+  # ── PRD — manual approval gate ────────────────────────────────────────────────
   apply-infra-prd:
     name: Apply infra — prd
     runs-on: self-hosted
     needs: [detect, apply-infra-tst, apply-group-a-tst, apply-group-b-tst, apply-group-c-tst]
     if: |
       always() &&
-      github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       needs.detect.outputs.infra_changed == 'true' &&
@@ -662,7 +630,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Auth GCP
-        if: env.ACT != 'true'
+        if: vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
@@ -687,7 +655,6 @@ jobs:
     needs: [detect, apply-infra-prd]
     if: |
       always() &&
-      github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       needs.detect.outputs.group_a != '[]' &&
@@ -701,7 +668,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Auth GCP
-        if: env.ACT != 'true'
+        if: vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
@@ -728,7 +695,6 @@ jobs:
     needs: [detect, apply-group-a-prd]
     if: |
       always() &&
-      github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       needs.detect.outputs.group_b != '[]' &&
@@ -742,7 +708,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Auth GCP
-        if: env.ACT != 'true'
+        if: vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
@@ -769,7 +735,6 @@ jobs:
     needs: [detect, apply-group-b-prd]
     if: |
       always() &&
-      github.event_name == 'pull_request' &&
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       needs.detect.outputs.group_c != '[]' &&
@@ -783,7 +748,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Auth GCP
-        if: env.ACT != 'true'
+        if: vars.ACT_LOCAL != 'true'
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY_JSON }}
