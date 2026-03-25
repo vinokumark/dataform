@@ -95,9 +95,9 @@ jobs:
             fi
           done
 
-          GA=$(printf '%s\n' "${GROUP_A[@]}" | jq -R . | jq -sc . 2>/dev/null || echo "[]")
-          GB=$(printf '%s\n' "${GROUP_B[@]}" | jq -R . | jq -sc . 2>/dev/null || echo "[]")
-          GC=$(printf '%s\n' "${GROUP_C[@]}" | jq -R . | jq -sc . 2>/dev/null || echo "[]")
+          GA=$(printf '%s\n' "${GROUP_A[@]}" | jq -R 'select(length > 0)' | jq -sc . 2>/dev/null || echo "[]")
+          GB=$(printf '%s\n' "${GROUP_B[@]}" | jq -R 'select(length > 0)' | jq -sc . 2>/dev/null || echo "[]")
+          GC=$(printf '%s\n' "${GROUP_C[@]}" | jq -R 'select(length > 0)' | jq -sc . 2>/dev/null || echo "[]")
 
           { [ "$GA" == "null" ] || [ -z "$GA" ]; } && GA="[]"
           { [ "$GB" == "null" ] || [ -z "$GB" ]; } && GB="[]"
@@ -147,7 +147,7 @@ jobs:
           GC='${{ needs.detect.outputs.group_c }}'
 
           MERGED=$(echo "[$GA,$GB,$GC]" \
-            | jq 'flatten | unique' 2>/dev/null || echo '[]')
+            | jq '[flatten[] | select(length > 0)] | unique' 2>/dev/null || echo '[]')
 
           { [ "$MERGED" == "[]" ] || [ -z "$MERGED" ]; } \
             && MERGED='["_no_change"]'
