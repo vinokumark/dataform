@@ -4,6 +4,9 @@ environment     = "dev"
 tfstate_bucket  = "qwiklabs-gcp-test-tfstate"
 dataset_labels  = { env = "dev" }
 
-ariba_tables   = []
+ariba_tables = [
+  { id = "ARIBA_CONTRACTS", clustflag = false, timePartitioned = false, rangePartitioned = false },
+]
+
 ariba_views    = []
 ariba_routines = []
