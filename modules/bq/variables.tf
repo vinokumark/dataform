@@ -1,8 +1,16 @@
-variable "project_id"          { type = string }
-variable "dataset_id"          { type = string }
-variable "location"            { type = string }
-variable "dataset_labels"      { type = map(string); default = {} }
-variable "deletion_protection" { type = bool; default = true }
+variable "project_id" { type = string }
+variable "dataset_id" { type = string }
+variable "location"   { type = string }
+
+variable "dataset_labels" {
+  type    = map(string)
+  default = {}
+}
+
+variable "deletion_protection" {
+  type    = bool
+  default = true
+}
 
 variable "tables" {
   type = list(object({
