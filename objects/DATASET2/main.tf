@@ -7,6 +7,11 @@ data "terraform_remote_state" "infra_for_apt" {
     bucket = var.tfstate_bucket
     prefix = "infra/${var.environment}"
   }
+  defaults = {
+    dataset_ids  = { APT = "", ARIBA = "", DATASET2 = "", REPORTING = "" }
+    project_id   = ""
+    bucket_names = {}
+  }
 }
 
 locals {
