@@ -1,4 +1,4 @@
-project_id  = "qwiklabs-gcp-02-848fd3d15653"
+project_id  = "qwiklabs-gcp-02-50ee4d1ce04f"
 region      = "EU"
 
 datasets = {
@@ -9,14 +9,14 @@ datasets = {
 }
 
 buckets = {
-  "my-gcp-project-dev-tfstate" = {
+  "qwiklabs-gcp-test-tfstate" = {
     location      = "EU"
     storage_class = "STANDARD"
     labels        = { env = "dev", purpose = "tfstate" }
     versioning    = true
     force_destroy = false
   }
-  "my-gcp-project-dev-dataform" = {
+  "qwiklabs-gcp-test-dataform" = {
     location      = "EU"
     storage_class = "STANDARD"
     labels        = { env = "dev", purpose = "dataform" }
