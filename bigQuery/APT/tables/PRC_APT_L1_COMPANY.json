@@ -2,5 +2,5 @@
   { "name": "COMPANY_ID",   "type": "STRING",    "mode": "REQUIRED" },
   { "name": "COMPANY_NAME", "type": "STRING",    "mode": "NULLABLE" },
   { "name": "CREATED_AT",   "type": "TIMESTAMP", "mode": "REQUIRED" },
-  { "name": "TEST",   "type": "STRING", "mode": "REQUIRED" }
+  { "name": "TESTS",   "type": "STRING", "mode": "REQUIRED" }
 ]
