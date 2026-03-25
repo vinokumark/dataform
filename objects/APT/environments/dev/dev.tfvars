@@ -7,6 +7,8 @@ dataset_labels  = { env = "dev" }
 apt_tables = [
   { id = "PRC_APT_L1_COMPANY",      clustflag = false, timePartitioned = false, rangePartitioned = false },
   { id = "PRC_APT_L1_COMPANY_COPY", clustflag = false, timePartitioned = false, rangePartitioned = false },
+  { id = "PRC_APT_L1_COMPANY1", clustflag = false, timePartitioned = false, rangePartitioned = false },
+
 ]
 
 apt_views = [
