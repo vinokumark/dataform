@@ -12,6 +12,8 @@ data "terraform_remote_state" "infra" {
 }
 
 locals {
-  dataset_id = data.terraform_remote_state.infra.outputs.dataset_ids["REPORTING"]
-  project_id = data.terraform_remote_state.infra.outputs.project_id
+  dataset_id        = data.terraform_remote_state.infra.outputs.dataset_ids["REPORTING"]
+  project_id        = data.terraform_remote_state.infra.outputs.project_id
+  apt_dataset_id    = data.terraform_remote_state.infra.outputs.dataset_ids["APT"]
+  dataset2_dataset_id = data.terraform_remote_state.infra.outputs.dataset_ids["DATASET2"]
 }
