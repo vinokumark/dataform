@@ -65,15 +65,15 @@ jobs:
             | cut -d'/' -f2 \
             | sort -u)
 
-          # folders changed in bigQuery/ — map to lowercase objects/ folder name
-          FOLDERS_BIGQUERY=$(echo "$CHANGED" \
-            | grep '^bigQuery/' \
-            | cut -d'/' -f2 \
-            | tr '[:upper:]' '[:lower:]' \
-            | sort -u)
+          # folders changed in bigQuery/ — case-insensitive match to actual objects/ folder name
+          FOLDERS_BIGQUERY=""
+          for bq_folder in $(echo "$CHANGED" | grep '^bigQuery/' | cut -d'/' -f2 | sort -u); do
+            matched=$(find objects -maxdepth 1 -type d -iname "$bq_folder" -printf '%f\n' 2>/dev/null | head -1)
+            [ -n "$matched" ] && FOLDERS_BIGQUERY="$FOLDERS_BIGQUERY $matched"
+          done
 
           # merge both sources, deduplicate
-          FOLDERS=$(printf '%s\n' "$FOLDERS_OBJECTS" "$FOLDERS_BIGQUERY" | sort -u | grep -v '^$')
+          FOLDERS=$(printf '%s\n' $FOLDERS_OBJECTS $FOLDERS_BIGQUERY | sort -u | grep -v '^$')
 
           echo "=== Changed object folders ==="
           echo "$FOLDERS"
@@ -158,7 +158,7 @@ jobs:
           GC='${{ needs.detect.outputs.group_c }}'
 
           MERGED=$(echo "[$GA,$GB,$GC]" \
-            | jq '[flatten[] | select(length > 0)] | unique' 2>/dev/null || echo '[]')
+            | jq -c '[flatten[] | select(length > 0)] | unique' 2>/dev/null || echo '[]')
 
           { [ "$MERGED" == "[]" ] || [ -z "$MERGED" ]; } \
             && MERGED='["_no_change"]'
