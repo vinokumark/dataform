@@ -1,2 +1,2 @@
-bucket = "my-tfstate-bucket"
-prefix = "objects/dataset2/dev"
+bucket = "qwiklabs-gcp-02-848fd3d15653-tfstate"
+prefix = "objects/DATASET2/dev"

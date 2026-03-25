@@ -1,2 +1,2 @@
-bucket = "my-tfstate-bucket"
+bucket = "qwiklabs-gcp-02-848fd3d15653-tfstate"
 prefix = "infra/dev"
