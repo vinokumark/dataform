@@ -59,10 +59,21 @@ jobs:
             && echo "infra_changed=true"  >> $GITHUB_OUTPUT \
             || echo "infra_changed=false" >> $GITHUB_OUTPUT
 
-          FOLDERS=$(echo "$CHANGED" \
+          # folders changed directly in objects/
+          FOLDERS_OBJECTS=$(echo "$CHANGED" \
             | grep '^objects/' \
             | cut -d'/' -f2 \
             | sort -u)
+
+          # folders changed in bigQuery/ — map to lowercase objects/ folder name
+          FOLDERS_BIGQUERY=$(echo "$CHANGED" \
+            | grep '^bigQuery/' \
+            | cut -d'/' -f2 \
+            | tr '[:upper:]' '[:lower:]' \
+            | sort -u)
+
+          # merge both sources, deduplicate
+          FOLDERS=$(printf '%s\n' "$FOLDERS_OBJECTS" "$FOLDERS_BIGQUERY" | sort -u | grep -v '^$')
 
           echo "=== Changed object folders ==="
           echo "$FOLDERS"
