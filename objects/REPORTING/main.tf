@@ -29,7 +29,12 @@ module "bq_reporting" {
     labels         = {}
     query = templatefile(
       "../../bigQuery/REPORTING/views/${upper(v.id)}.sql",
-      { projectid = local.project_id, datasetname = local.dataset_id }
+      {
+        projectid        = local.project_id
+        datasetname      = local.dataset_id
+        aptdatasetname   = local.apt_dataset_id
+        dataset2datasetname = local.dataset2_dataset_id
+      }
     )
   }]
 
