@@ -1,2 +1,2 @@
-bucket = "qwiklabs-gcp-02-848fd3d15653-tfstate"
+bucket = "qwiklabs-gcp-test-tfstate"
 prefix = "objects/DATASET2/dev"
