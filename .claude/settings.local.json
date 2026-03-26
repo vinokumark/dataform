@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(mkdir -p \"C:/Users/2256842/Downloads/dataform/dataform/.github/workflows\")",
-      "Bash(cp \"C:/Users/2256842/Downloads/dataform/dataform/final_cicd.txt\" \"C:/Users/2256842/Downloads/dataform/dataform/.github/workflows/cicd.yml\")"
-    ]
-  }
-}
