@@ -71,7 +71,7 @@ jobs:
           done
 
           # merge both sources, deduplicate
-          FOLDERS=$(printf '%s\n' $FOLDERS_OBJECTS $FOLDERS_BIGQUERY | sort -u | grep -v '^$')
+          FOLDERS=$(printf '%s\n' $FOLDERS_OBJECTS $FOLDERS_BIGQUERY | sort -u | grep -v '^$' || true)
 
           echo "=== Changed object folders ==="
           echo "$FOLDERS"
